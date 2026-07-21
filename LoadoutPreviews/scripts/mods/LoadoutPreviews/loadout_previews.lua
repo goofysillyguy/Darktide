@@ -34,6 +34,9 @@ local Game = {
 	WeaponTweakTemplateSettings = require("scripts/settings/equipment/weapon_templates/weapon_tweak_template_settings"),
 }
 
+local valid_material_path
+local safe_material_path
+
 local PREVIEW_MODE = {
 	disabled = "disabled",
 	tree = "tree",
@@ -75,6 +78,7 @@ local BETTER_LOADOUTS_LAYOUT = {
 	screen_margin_bottom = 24,
 }
 local PREVIEW_LAYOUTS = {
+	fallback_texture = "content/ui/materials/base/ui_default_base",
 	default = {
 		map_width = 420,
 		map_height = 752,
@@ -188,6 +192,7 @@ local TEAM_PREVIEW_LAYOUT = {
 	scenegraph_id = "loadout_previews_overlay",
 }
 local WEAPON_LAYOUT = {
+	fallback_icon = "content/ui/materials/icons/weapons/hud/combat_blade_01",
 	row_height = 58,
 	row_height_text = 76,
 	row_height_details = 104,
@@ -1470,6 +1475,18 @@ local function estimated_wrapped_line_count(text, width, average_char_width)
 	return count
 end
 
+function valid_material_path(value)
+	return type(value) == "string" and string.sub(value, 1, 8) == "content/"
+end
+
+function safe_material_path(value, fallback)
+	if valid_material_path(value) then
+		return value
+	end
+
+	return fallback or PREVIEW_LAYOUTS.fallback_texture
+end
+
 local function init_gear_preview_widget(parent, widget, element)
 	local content = widget and widget.content
 
@@ -1506,7 +1523,7 @@ local function init_gear_preview_widget(parent, widget, element)
 			local perks = weapon.perks
 
 			content["weapon_text_" .. i] = weapon.text or ""
-			content["weapon_icon_" .. i] = weapon.icon
+			content["weapon_icon_" .. i] = safe_material_path(weapon.icon, WEAPON_LAYOUT.fallback_icon)
 
 			if preview_detail_line_count(perks) > 0 then
 				content["weapon_perk_text_" .. i] = format_preview_detail_text(perks)
@@ -1881,15 +1898,19 @@ local function safe_item_display_name(item)
 end
 
 local function weapon_preview_icon(item)
-	local ok, icon = pcall(function ()
-		return item and item.hud_icon
-	end)
-
-	if not ok or type(icon) ~= "string" or string.sub(icon, 1, 8) ~= "content/" then
+	if not item then
 		return nil
 	end
 
-	return icon
+	local ok, icon = pcall(function ()
+		return item.hud_icon
+	end)
+
+	if not ok then
+		return WEAPON_LAYOUT.fallback_icon
+	end
+
+	return safe_material_path(icon, WEAPON_LAYOUT.fallback_icon)
 end
 
 local function modifier_item(modifier)
@@ -2903,8 +2924,26 @@ local function is_stat_node(node_type, icon)
 	return node_type == "stat" or node_type == "iconic" or icon == "content/ui/textures/frames/talents/circular_small_frame" or icon == "content/ui/materials/frames/talents/circular_small_bg"
 end
 
-local function valid_material_path(value)
-	return type(value) == "string" and string.sub(value, 1, 8) == "content/"
+local function sanitize_widget_texture_content(widget)
+	local content = widget and widget.content
+	local passes = widget and widget.passes
+
+	if type(content) ~= "table" or type(passes) ~= "table" then
+		return
+	end
+
+	for i = 1, #passes do
+		local pass = passes[i]
+		local pass_type = pass and pass.pass_type
+
+		if pass_type == "texture" or pass_type == "rotated_texture" then
+			local value_id = pass.value_id
+
+			if value_id and not valid_material_path(content[value_id]) then
+				content[value_id] = string.sub(value_id, 1, 12) == "weapon_icon_" and WEAPON_LAYOUT.fallback_icon or PREVIEW_LAYOUTS.fallback_texture
+			end
+		end
+	end
 end
 
 local function source_node_size(node_type)
@@ -3621,7 +3660,7 @@ local function weapon_row_layout(weapon, text_mode, panel_width, weapon_icons_vi
 	local detail_count = blessing_count + perk_count
 	local show_icon = false
 
-	if weapon_icons_visible ~= false and weapon and weapon.icon ~= nil then
+	if weapon_icons_visible ~= false and weapon and valid_material_path(weapon.icon) then
 		show_icon = true
 	end
 
@@ -3908,6 +3947,7 @@ local function add_weapon_row_passes(pass_template, weapon_index, weapon, x, y, 
 	local blessing_y = detail_y + (perk_count > 0 and perk_height + layout.detail_group_gap or 0)
 	local icon_value_id = "weapon_icon_" .. weapon_index
 	local name_y = show_icon and icon_y + WEAPON_LAYOUT.icon_height + WEAPON_LAYOUT.icon_name_gap or header_y
+	local icon = show_icon and safe_material_path(weapon.icon, WEAPON_LAYOUT.fallback_icon) or nil
 
 	pass_template[#pass_template + 1] = {
 		pass_type = "rect",
@@ -3931,7 +3971,7 @@ local function add_weapon_row_passes(pass_template, weapon_index, weapon, x, y, 
 		pass_template[#pass_template + 1] = {
 			pass_type = "texture",
 			style_id = icon_value_id,
-			value = weapon.icon,
+			value = icon,
 			value_id = icon_value_id,
 			style = {
 				horizontal_alignment = "left",
@@ -5171,8 +5211,28 @@ function TeamPreview.build_element(view, player, profile, include_title, context
 	return wrapped and TeamPreview.scale_element(wrapped, TeamPreview.context_scale(context, preview_mode, tree_only)) or nil
 end
 
+function TeamPreview.destroy_widget_resources(view, widget, context, optional_renderer)
+	if not widget or widget._loadout_previews_destroyed then
+		return
+	end
+
+	widget._loadout_previews_destroyed = true
+
+	local ui_renderer = optional_renderer or widget._loadout_previews_ui_renderer or view and view._ui_renderer
+
+	if ui_renderer then
+		Settings.safe_call(context or "destroy loadout preview widget resources", UIWidget and UIWidget.destroy, ui_renderer, widget)
+	end
+
+	widget._loadout_previews_ui_renderer = nil
+end
+
 function TeamPreview.destroy_slot_widget(view, slot)
 	local widget = slot and slot._loadout_previews_widget
+
+	if widget then
+		TeamPreview.destroy_widget_resources(view, widget, "destroy team preview widget resources")
+	end
 
 	if widget and view and view._unregister_widget_name then
 		Settings.safe_method("unregister team preview widget", view, "_unregister_widget_name", widget.name)
@@ -5331,6 +5391,10 @@ function TeamPreview.draw_widget(widget, ui_renderer, context)
 	if not widget or not ui_renderer then
 		return false
 	end
+
+	sanitize_widget_texture_content(widget)
+
+	widget._loadout_previews_ui_renderer = ui_renderer
 
 	local ok = Settings.safe_call(context or "draw loadout preview widget", UIWidget and UIWidget.draw, widget, ui_renderer)
 
@@ -5776,6 +5840,10 @@ end
 
 function ApplicantPreview.destroy_widget(view)
 	local widget = view and view._loadout_previews_applicant_widget
+
+	if widget then
+		TeamPreview.destroy_widget_resources(view, widget, "destroy party finder applicant preview widget resources")
+	end
 
 	if widget and view._unregister_widget_name then
 		Settings.safe_method("unregister party finder applicant preview widget", view, "_unregister_widget_name", widget.name)
@@ -6512,8 +6580,10 @@ mod:hook_safe("LobbyView", "_draw_widgets", function (self, dt, t, input_service
 	TeamPreview.draw_lobby(self, ui_renderer)
 end)
 
-mod:hook_safe("GroupFinderView", "on_exit", function (self)
+mod:hook("GroupFinderView", "on_exit", function (func, self, ...)
 	ApplicantPreview.destroy_widget(self)
+
+	return func(self, ...)
 end)
 
 mod:hook_safe("LobbyView", "_reset_spawn_slot", function (self, slot)
@@ -6522,6 +6592,13 @@ end)
 
 mod:hook("LobbyView", "_destroy_spawn_slots", function (func, self, ...)
 	TeamPreview.clear_view_widgets(self)
+
+	return func(self, ...)
+end)
+
+mod:hook("MissionIntroView", "on_exit", function (func, self, ...)
+	TeamPreview.clear_view_widgets(self)
+	TeamPreview._mission_intro_tree_gear_scale = nil
 
 	return func(self, ...)
 end)
